@@ -582,6 +582,51 @@ def get_coaching_response(session: Dict, user_message: str) -> str:
     return assistant_message
 
 
+def get_coaching_response_stream(session: Dict, user_message: str):
+    """Get coaching feedback using Claude API with streaming."""
+    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+
+    resume_context = _build_resume_context(session.get("parsed_resume"))
+    job_context = _build_job_context(session.get("parsed_job_description"))
+    interviewer_ctx = _get_interviewer_context(session.get("interviewer_type", "hiring_manager"))
+
+    system_prompt = COACH_SYSTEM_PROMPT.format(
+        role=session["role"],
+        company=session["company"],
+        question_type=session["question_type"],
+        current_step=session["current_step"],
+        current_question=session["current_question"],
+        anchors=", ".join(session["anchors"]) if session["anchors"] else "None yet",
+        principle=session["principle"] or "Not identified yet",
+        resume_context=resume_context,
+        job_context=job_context,
+        interviewer_name=interviewer_ctx["name"],
+        interviewer_focus=interviewer_ctx["focus"],
+        interviewer_style=interviewer_ctx["style"],
+        interviewer_tips=interviewer_ctx["tips"]
+    )
+
+    # Build message history
+    messages = session.get("history", [])[-10:]
+    messages.append({"role": "user", "content": user_message})
+
+    # Stream the response
+    with client.messages.stream(
+        model="claude-haiku-4-20250414",
+        max_tokens=1024,
+        system=system_prompt,
+        messages=messages
+    ) as stream:
+        full_response = ""
+        for text in stream.text_stream:
+            full_response += text
+            yield text
+
+    # Update history after streaming completes
+    session["history"].append({"role": "user", "content": user_message})
+    session["history"].append({"role": "assistant", "content": full_response})
+
+
 # =============================================================================
 # API HANDLER
 # =============================================================================
@@ -595,6 +640,14 @@ class handler(BaseHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Headers', 'Content-Type')
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
+
+    def _send_stream_error(self, error_msg: str):
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        self.wfile.write(f"data: {json.dumps({'error': error_msg})}\n\n".encode())
+        self.wfile.flush()
 
     def do_OPTIONS(self):
         self._send_response(200, {})
@@ -716,6 +769,49 @@ Provide coaching based on the current step. Do NOT advance until they say confid
                 "current_step": session["current_step"],
                 "session": session
             })
+
+        # Stream response (for faster perceived performance)
+        elif path == "/api/respond-stream":
+            session_id = data.get("session_id")
+            response = data.get("response", "")
+
+            session = get_session(session_id)
+            if not session:
+                self._send_stream_error("Session not found")
+                return
+
+            if not response:
+                self._send_stream_error("Response is required")
+                return
+
+            context = f"""
+CURRENT STEP: {session['current_step']}
+QUESTION: {session['current_question']}
+
+CANDIDATE RESPONSE: {response}
+
+Provide coaching based on the current step. Do NOT advance until they say confident.
+"""
+
+            # Send SSE headers
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Connection', 'keep-alive')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+
+            try:
+                for chunk in get_coaching_response_stream(session, context):
+                    self.wfile.write(f"data: {json.dumps({'text': chunk})}\n\n".encode())
+                    self.wfile.flush()
+
+                # Send done signal
+                self.wfile.write(f"data: {json.dumps({'done': True, 'current_step': session['current_step']})}\n\n".encode())
+                self.wfile.flush()
+            except Exception as e:
+                self.wfile.write(f"data: {json.dumps({'error': str(e)})}\n\n".encode())
+                self.wfile.flush()
 
         # Confirm confidence
         elif path == "/api/confirm":
