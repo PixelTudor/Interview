@@ -8,6 +8,8 @@ from http.server import BaseHTTPRequestHandler
 import json
 import os
 import random
+import re
+import base64
 from typing import Dict, List, Optional
 from enum import Enum
 import anthropic
@@ -32,6 +34,55 @@ class TrainingStep(str, Enum):
     DELIVERY_PRACTICE = "delivery_practice"
     COMPRESSION = "compression"
     RANDOM_ENTRY = "random_entry"
+
+
+class InterviewerType(str, Enum):
+    HIRING_MANAGER = "hiring_manager"
+    RECRUITER = "recruiter"
+    SKIP_LEVEL = "skip_level"
+    PEER = "peer"
+    HR = "hr"
+    PANEL = "panel"
+
+
+INTERVIEWER_CONTEXTS = {
+    InterviewerType.HIRING_MANAGER: {
+        "name": "Hiring Manager",
+        "focus": "technical depth, team fit, day-to-day responsibilities, management style compatibility",
+        "style": "Direct and detailed. Will probe deeply into past experiences and specific examples. Wants to know HOW you work, not just WHAT you've done.",
+        "tips": "Be specific about methodologies. Show you understand the role deeply. Ask thoughtful questions about the team."
+    },
+    InterviewerType.RECRUITER: {
+        "name": "Recruiter/Talent Acquisition",
+        "focus": "culture fit, compensation expectations, availability, high-level qualifications, red flags",
+        "style": "Warm but screening. Looking for deal-breakers and cultural alignment. Questions are broader and less technical.",
+        "tips": "Be concise and positive. Don't over-explain technical details. Show enthusiasm for the company."
+    },
+    InterviewerType.SKIP_LEVEL: {
+        "name": "Skip-Level Manager (Hiring Manager's Boss)",
+        "focus": "strategic thinking, leadership potential, business impact, long-term vision",
+        "style": "Big picture focused. Less interested in details, more interested in impact and trajectory. Tests executive presence.",
+        "tips": "Lead with outcomes and business impact. Show strategic thinking. Keep answers concise and impactful."
+    },
+    InterviewerType.PEER: {
+        "name": "Peer/Colleague",
+        "focus": "collaboration style, technical credibility, team dynamics, culture add",
+        "style": "Conversational and evaluating chemistry. Looking for someone they'd want to work with daily.",
+        "tips": "Be authentic and collaborative. Show curiosity about their work. Demonstrate you're a team player."
+    },
+    InterviewerType.HR: {
+        "name": "HR/People Operations",
+        "focus": "behavioral competencies, conflict resolution, values alignment, compliance awareness",
+        "style": "Structured behavioral questions. Often uses STAR format. Looking for consistency and professionalism.",
+        "tips": "Use STAR format. Be consistent with your stories. Show emotional intelligence."
+    },
+    InterviewerType.PANEL: {
+        "name": "Panel Interview",
+        "focus": "multiple perspectives, handling pressure, consistent messaging, engaging multiple stakeholders",
+        "style": "Multiple interviewers with different agendas. Tests your ability to manage attention and adapt communication style.",
+        "tips": "Make eye contact with everyone. Address the questioner but include others. Stay consistent across different questions."
+    }
+}
 
 
 # In-memory session storage (for demo - use Redis/DB in production)
@@ -170,6 +221,21 @@ Key competencies:
 - GCP/ICH compliance
 - Oncology drug development
 
+## INTERVIEWER CONTEXT:
+
+Interviewer Type: {interviewer_name}
+Focus Areas: {interviewer_focus}
+Interview Style: {interviewer_style}
+Coaching Tips: {interviewer_tips}
+
+Adapt your coaching based on WHO is interviewing. Different interviewers look for different things.
+
+## CANDIDATE BACKGROUND (FROM RESUME):
+{resume_context}
+
+## JOB REQUIREMENTS:
+{job_context}
+
 ## CURRENT SESSION STATE:
 
 Question Type: {question_type}
@@ -178,7 +244,9 @@ Current Question: {current_question}
 Anchors: {anchors}
 Principle: {principle}
 
-Keep responses SHORT and FOCUSED. Use line breaks. Be punchy."""
+Keep responses SHORT and FOCUSED. Use line breaks. Be punchy.
+If resume/job description are provided, tailor your coaching to highlight how the candidate's experience aligns with the role requirements.
+Point out gaps and help the candidate prepare stories that address them."""
 
 
 # =============================================================================
@@ -189,25 +257,294 @@ def get_session(session_id: str) -> Optional[Dict]:
     return SESSIONS.get(session_id)
 
 
-def create_session(session_id: str, role: str = None, company: str = None) -> Dict:
+def create_session(session_id: str, role: str = None, company: str = None, interviewer_type: str = None) -> Dict:
     session = {
         "session_id": session_id,
         "role": role or "Senior Study Manager",
         "company": company or "Taiho Oncology",
+        "interviewer_type": interviewer_type or InterviewerType.HIRING_MANAGER.value,
         "question_type": "curveball",
         "current_step": "identify_principle",
         "current_question": "",
         "anchors": [],
         "principle": "",
-        "history": []
+        "history": [],
+        "resume": None,
+        "job_description": None,
+        "parsed_resume": None,
+        "parsed_job_description": None
     }
     SESSIONS[session_id] = session
     return session
 
 
+def _is_section_header(line: str, headers: List[str]) -> bool:
+    """Check if a line is a section header (not just contains header words)."""
+    line_clean = re.sub(r'[:\-–—]', '', line.lower()).strip()
+
+    # A header line should be short and match or start with a known header
+    if len(line_clean) > 50:
+        return False
+
+    # Check for exact match or starts with header
+    for header in headers:
+        if line_clean == header or line_clean.startswith(header + ' '):
+            return True
+        # Also check if line is just the header with some punctuation
+        if header in line_clean and len(line_clean) < len(header) + 15:
+            return True
+
+    return False
+
+
+def parse_resume(resume_text: str) -> Dict:
+    """Parse resume text and extract key information."""
+    parsed = {
+        "raw_text": resume_text,
+        "skills": [],
+        "experience": [],
+        "education": [],
+        "summary": ""
+    }
+
+    if not resume_text:
+        return parsed
+
+    lines = resume_text.strip().split('\n')
+    current_section = None
+    section_content = []
+
+    # Common section headers
+    skill_headers = ['skills', 'technical skills', 'core competencies', 'competencies', 'expertise']
+    exp_headers = ['experience', 'work experience', 'professional experience', 'employment', 'work history']
+    edu_headers = ['education', 'academic background', 'qualifications', 'degrees']
+    summary_headers = ['summary', 'professional summary', 'profile', 'objective', 'about']
+
+    for line in lines:
+        # Check for section headers (must be short header-like lines)
+        if _is_section_header(line, skill_headers):
+            if current_section and section_content:
+                _save_section(parsed, current_section, section_content)
+            current_section = 'skills'
+            section_content = []
+        elif _is_section_header(line, exp_headers):
+            if current_section and section_content:
+                _save_section(parsed, current_section, section_content)
+            current_section = 'experience'
+            section_content = []
+        elif _is_section_header(line, edu_headers):
+            if current_section and section_content:
+                _save_section(parsed, current_section, section_content)
+            current_section = 'education'
+            section_content = []
+        elif _is_section_header(line, summary_headers):
+            if current_section and section_content:
+                _save_section(parsed, current_section, section_content)
+            current_section = 'summary'
+            section_content = []
+        elif line.strip():
+            section_content.append(line.strip())
+
+    # Save last section
+    if current_section and section_content:
+        _save_section(parsed, current_section, section_content)
+
+    # If no sections found, use full text as summary
+    if not parsed['summary'] and not parsed['experience']:
+        parsed['summary'] = resume_text[:1000]
+
+    return parsed
+
+
+def _save_section(parsed: Dict, section: str, content: List[str]) -> None:
+    """Helper to save parsed section content."""
+    if section == 'skills':
+        # Extract individual skills from bullet points or comma-separated lists
+        for line in content:
+            # Handle comma or bullet-separated skills
+            skills = re.split(r'[,•·\|]', line)
+            for skill in skills:
+                skill = skill.strip()
+                if skill and len(skill) > 1:
+                    parsed['skills'].append(skill)
+    elif section == 'experience':
+        parsed['experience'] = content
+    elif section == 'education':
+        parsed['education'] = content
+    elif section == 'summary':
+        parsed['summary'] = ' '.join(content)
+
+
+def parse_job_description(jd_text: str) -> Dict:
+    """Parse job description and extract key requirements."""
+    parsed = {
+        "raw_text": jd_text,
+        "title": "",
+        "requirements": [],
+        "responsibilities": [],
+        "qualifications": [],
+        "company_info": ""
+    }
+
+    if not jd_text:
+        return parsed
+
+    lines = jd_text.strip().split('\n')
+    current_section = None
+    section_content = []
+    title_candidates_checked = 0
+
+    # Common section headers
+    req_headers = ['requirements', 'required', 'must have', 'essential']
+    resp_headers = ['responsibilities', 'duties', 'what you will do', 'role', 'job duties']
+    qual_headers = ['qualifications', 'preferred', 'nice to have', 'desired', 'skills']
+    about_headers = ['about', 'about the company', 'company', 'who we are', 'overview']
+
+    for line in lines:
+        # Check for section headers first (must be short header-like lines)
+        if _is_section_header(line, req_headers):
+            if current_section and section_content:
+                _save_jd_section(parsed, current_section, section_content)
+            current_section = 'requirements'
+            section_content = []
+            continue
+        elif _is_section_header(line, resp_headers):
+            if current_section and section_content:
+                _save_jd_section(parsed, current_section, section_content)
+            current_section = 'responsibilities'
+            section_content = []
+            continue
+        elif _is_section_header(line, qual_headers):
+            if current_section and section_content:
+                _save_jd_section(parsed, current_section, section_content)
+            current_section = 'qualifications'
+            section_content = []
+            continue
+        elif _is_section_header(line, about_headers):
+            if current_section and section_content:
+                _save_jd_section(parsed, current_section, section_content)
+            current_section = 'company_info'
+            section_content = []
+            continue
+
+        # If we haven't found a title yet and haven't entered a section,
+        # the first non-empty line is likely the title
+        if line.strip():
+            if not parsed['title'] and current_section is None and title_candidates_checked < 3:
+                parsed['title'] = line.strip()
+                title_candidates_checked += 1
+            else:
+                section_content.append(line.strip())
+
+    # Save last section
+    if current_section and section_content:
+        _save_jd_section(parsed, current_section, section_content)
+
+    return parsed
+
+
+def _save_jd_section(parsed: Dict, section: str, content: List[str]) -> None:
+    """Helper to save parsed job description section content."""
+    if section == 'requirements':
+        parsed['requirements'] = content
+    elif section == 'responsibilities':
+        parsed['responsibilities'] = content
+    elif section == 'qualifications':
+        parsed['qualifications'] = content
+    elif section == 'company_info':
+        parsed['company_info'] = ' '.join(content)
+
+
+def generate_personalized_questions(session: Dict) -> List[str]:
+    """Generate interview questions based on resume and job description."""
+    questions = []
+
+    resume = session.get('parsed_resume') or {}
+    jd = session.get('parsed_job_description') or {}
+
+    # Generate questions based on experience
+    if resume.get('experience'):
+        for exp in resume['experience'][:3]:
+            if len(exp) > 20:
+                questions.append(f"Tell me more about your experience with: {exp[:100]}...")
+
+    # Generate questions based on skills vs requirements
+    resume_skills = set(s.lower() for s in resume.get('skills', []))
+    jd_requirements = jd.get('requirements', [])
+
+    for req in jd_requirements[:5]:
+        req_lower = req.lower()
+        # Check if any skill matches the requirement
+        matching = any(skill in req_lower for skill in resume_skills)
+        if matching:
+            questions.append(f"You mentioned relevant experience. Can you elaborate on: {req}")
+        else:
+            questions.append(f"This role requires: {req}. How would you approach this?")
+
+    # Generate questions about responsibilities
+    for resp in jd.get('responsibilities', [])[:3]:
+        questions.append(f"How would you handle: {resp}")
+
+    # Add gap analysis questions
+    if jd.get('qualifications'):
+        questions.append(f"What makes you qualified for this role given the requirements: {', '.join(jd['qualifications'][:3])}?")
+
+    return questions if questions else None
+
+
+def _build_resume_context(parsed_resume: Optional[Dict]) -> str:
+    """Build resume context string for the system prompt."""
+    if not parsed_resume:
+        return "No resume provided yet."
+
+    parts = []
+    if parsed_resume.get('summary'):
+        parts.append(f"Summary: {parsed_resume['summary'][:500]}")
+    if parsed_resume.get('skills'):
+        parts.append(f"Skills: {', '.join(parsed_resume['skills'][:15])}")
+    if parsed_resume.get('experience'):
+        exp_text = '; '.join(parsed_resume['experience'][:5])
+        parts.append(f"Experience highlights: {exp_text[:500]}")
+    if parsed_resume.get('education'):
+        parts.append(f"Education: {', '.join(parsed_resume['education'][:3])}")
+
+    return '\n'.join(parts) if parts else "Resume uploaded but no key details extracted."
+
+
+def _build_job_context(parsed_jd: Optional[Dict]) -> str:
+    """Build job description context string for the system prompt."""
+    if not parsed_jd:
+        return "No job description provided yet."
+
+    parts = []
+    if parsed_jd.get('title'):
+        parts.append(f"Job Title: {parsed_jd['title']}")
+    if parsed_jd.get('requirements'):
+        parts.append(f"Key Requirements: {'; '.join(parsed_jd['requirements'][:5])}")
+    if parsed_jd.get('responsibilities'):
+        parts.append(f"Responsibilities: {'; '.join(parsed_jd['responsibilities'][:5])}")
+    if parsed_jd.get('qualifications'):
+        parts.append(f"Qualifications: {'; '.join(parsed_jd['qualifications'][:5])}")
+
+    return '\n'.join(parts) if parts else "Job description uploaded but no key details extracted."
+
+
+def _get_interviewer_context(interviewer_type: str) -> Dict:
+    """Get interviewer context based on type."""
+    try:
+        int_type = InterviewerType(interviewer_type)
+        return INTERVIEWER_CONTEXTS.get(int_type, INTERVIEWER_CONTEXTS[InterviewerType.HIRING_MANAGER])
+    except (ValueError, KeyError):
+        return INTERVIEWER_CONTEXTS[InterviewerType.HIRING_MANAGER]
+
+
 def get_coaching_response(session: Dict, user_message: str) -> str:
     """Get coaching feedback using Claude API."""
     client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+
+    resume_context = _build_resume_context(session.get("parsed_resume"))
+    job_context = _build_job_context(session.get("parsed_job_description"))
+    interviewer_ctx = _get_interviewer_context(session.get("interviewer_type", "hiring_manager"))
 
     system_prompt = COACH_SYSTEM_PROMPT.format(
         role=session["role"],
@@ -216,7 +553,13 @@ def get_coaching_response(session: Dict, user_message: str) -> str:
         current_step=session["current_step"],
         current_question=session["current_question"],
         anchors=", ".join(session["anchors"]) if session["anchors"] else "None yet",
-        principle=session["principle"] or "Not identified yet"
+        principle=session["principle"] or "Not identified yet",
+        resume_context=resume_context,
+        job_context=job_context,
+        interviewer_name=interviewer_ctx["name"],
+        interviewer_focus=interviewer_ctx["focus"],
+        interviewer_style=interviewer_ctx["style"],
+        interviewer_tips=interviewer_ctx["tips"]
     )
 
     # Build message history
@@ -262,13 +605,28 @@ class handler(BaseHTTPRequestHandler):
                 "status": "healthy",
                 "service": "Interview Coach",
                 "endpoints": [
-                    "POST /api/sessions - Create session",
+                    "GET /api/interviewer-types - List interviewer types",
+                    "POST /api/sessions - Create session (accepts interviewer_type)",
                     "POST /api/question - Get question",
                     "POST /api/respond - Submit response",
                     "POST /api/confirm - Confirm confidence",
-                    "POST /api/interrupt - Get interruption"
+                    "POST /api/interrupt - Get interruption",
+                    "POST /api/resume - Upload resume",
+                    "POST /api/job-description - Upload job description",
+                    "POST /api/personalized-question - Get personalized question"
                 ]
             })
+        elif self.path == "/api/interviewer-types" or self.path == "/api/interviewer-types/":
+            types = []
+            for int_type in InterviewerType:
+                ctx = INTERVIEWER_CONTEXTS[int_type]
+                types.append({
+                    "value": int_type.value,
+                    "name": ctx["name"],
+                    "focus": ctx["focus"],
+                    "tips": ctx["tips"]
+                })
+            self._send_response(200, {"interviewer_types": types})
         else:
             self._send_response(404, {"error": "Not found"})
 
@@ -288,11 +646,17 @@ class handler(BaseHTTPRequestHandler):
             session_id = data.get("session_id", f"session_{random.randint(10000, 99999)}")
             role = data.get("role")
             company = data.get("company")
+            interviewer_type = data.get("interviewer_type")
 
-            session = create_session(session_id, role, company)
+            session = create_session(session_id, role, company, interviewer_type)
+
+            # Get interviewer context for response
+            interviewer_ctx = _get_interviewer_context(session["interviewer_type"])
+
             self._send_response(200, {
                 "session_id": session_id,
-                "message": "Session created. Ready to begin coaching.",
+                "message": f"Session created. You're preparing for an interview with: {interviewer_ctx['name']}",
+                "interviewer_tips": interviewer_ctx["tips"],
                 "session": session
             })
 
@@ -441,6 +805,96 @@ Provide coaching based on the current step. Do NOT advance until they say confid
                 "message": "Principle captured.",
                 "principle": principle
             })
+
+        # Upload resume
+        elif path == "/api/resume":
+            session_id = data.get("session_id")
+            resume_text = data.get("resume_text", "")
+
+            session = get_session(session_id)
+            if not session:
+                self._send_response(400, {"error": "Session not found"})
+                return
+
+            if not resume_text:
+                self._send_response(400, {"error": "Resume text is required"})
+                return
+
+            session["resume"] = resume_text
+            session["parsed_resume"] = parse_resume(resume_text)
+
+            self._send_response(200, {
+                "message": "Resume uploaded and parsed successfully.",
+                "parsed": session["parsed_resume"],
+                "skills_found": len(session["parsed_resume"].get("skills", [])),
+                "experience_items": len(session["parsed_resume"].get("experience", []))
+            })
+
+        # Upload job description
+        elif path == "/api/job-description":
+            session_id = data.get("session_id")
+            jd_text = data.get("job_description", "")
+
+            session = get_session(session_id)
+            if not session:
+                self._send_response(400, {"error": "Session not found"})
+                return
+
+            if not jd_text:
+                self._send_response(400, {"error": "Job description is required"})
+                return
+
+            session["job_description"] = jd_text
+            session["parsed_job_description"] = parse_job_description(jd_text)
+
+            # Update role and company from JD if available
+            if session["parsed_job_description"].get("title"):
+                session["role"] = session["parsed_job_description"]["title"]
+
+            self._send_response(200, {
+                "message": "Job description uploaded and parsed successfully.",
+                "parsed": session["parsed_job_description"],
+                "requirements_found": len(session["parsed_job_description"].get("requirements", [])),
+                "responsibilities_found": len(session["parsed_job_description"].get("responsibilities", []))
+            })
+
+        # Get personalized questions based on resume and JD
+        elif path == "/api/personalized-question":
+            session_id = data.get("session_id")
+
+            session = get_session(session_id)
+            if not session:
+                self._send_response(400, {"error": "Session not found"})
+                return
+
+            if not session.get("parsed_resume") and not session.get("parsed_job_description"):
+                self._send_response(400, {
+                    "error": "Please upload a resume or job description first"
+                })
+                return
+
+            personalized_questions = generate_personalized_questions(session)
+
+            if personalized_questions:
+                question = random.choice(personalized_questions)
+                session["current_question"] = question
+                session["question_type"] = "personalized"
+                session["current_step"] = "identify_principle"
+                session["anchors"] = []
+                session["principle"] = ""
+
+                self._send_response(200, {
+                    "question_type": "personalized",
+                    "question": question,
+                    "instruction": "This question is tailored to your resume and the job requirements. Take your time.",
+                    "current_step": session["current_step"],
+                    "total_personalized_available": len(personalized_questions)
+                })
+            else:
+                self._send_response(200, {
+                    "message": "Could not generate personalized questions. Using standard questions.",
+                    "suggestion": "Try adding more detail to your resume or job description."
+                })
 
         else:
             self._send_response(404, {"error": "Endpoint not found"})

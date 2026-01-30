@@ -333,6 +333,79 @@
             color: white;
         }
 
+        .file-upload-area {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+
+        .file-upload-area textarea {
+            width: 100%;
+            padding: 0.75rem 1rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text-primary);
+            font-size: 0.9rem;
+            resize: vertical;
+            font-family: inherit;
+        }
+
+        .file-upload-area textarea:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+
+        .file-upload-row {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .file-upload-row input[type="file"] {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+        }
+
+        .file-upload-row input[type="file"]::file-selector-button {
+            padding: 0.4rem 0.8rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text-primary);
+            cursor: pointer;
+            margin-right: 0.75rem;
+        }
+
+        .file-upload-row input[type="file"]::file-selector-button:hover {
+            background: var(--border);
+        }
+
+        .upload-status {
+            font-size: 0.8rem;
+            color: var(--success);
+        }
+
+        .upload-status.error {
+            color: #ef4444;
+        }
+
+        .context-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.25rem;
+            padding: 0.2rem 0.5rem;
+            background: var(--success);
+            color: white;
+            border-radius: 4px;
+            font-size: 0.7rem;
+            margin-left: 0.5rem;
+        }
+
+        .context-badge.interviewer {
+            background: var(--accent);
+        }
+
         @media (max-width: 640px) {
             .container {
                 padding: 1rem;
@@ -376,6 +449,18 @@
             </div>
 
             <div class="form-group">
+                <label for="interviewer-type">Who will you be interviewing with?</label>
+                <select id="interviewer-type">
+                    <option value="hiring_manager">Hiring Manager - Technical depth & team fit</option>
+                    <option value="recruiter">Recruiter/TA - Culture fit & screening</option>
+                    <option value="skip_level">Skip-Level Manager - Strategic thinking & impact</option>
+                    <option value="peer">Peer/Colleague - Collaboration & chemistry</option>
+                    <option value="hr">HR/People Ops - Behavioral & values</option>
+                    <option value="panel">Panel Interview - Multiple stakeholders</option>
+                </select>
+            </div>
+
+            <div class="form-group">
                 <label for="question-type">Start with which question type?</label>
                 <select id="question-type">
                     <option value="curveball">Curveball — Pressure & Recovery</option>
@@ -383,7 +468,30 @@
                     <option value="cro_management">CRO Management — Oversight & Partnership</option>
                     <option value="behavioral">Behavioral — Tell me about a time...</option>
                     <option value="motivation">Motivation — What drives you?</option>
+                    <option value="personalized">Personalized — Based on your resume & JD</option>
                 </select>
+            </div>
+
+            <div class="form-group">
+                <label for="resume-input">Your Resume (paste text or upload file)</label>
+                <div class="file-upload-area">
+                    <textarea id="resume-input" placeholder="Paste your resume text here..." rows="4"></textarea>
+                    <div class="file-upload-row">
+                        <input type="file" id="resume-file" accept=".txt,.pdf,.doc,.docx" onchange="handleFileUpload('resume')">
+                        <span id="resume-status" class="upload-status"></span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="form-group">
+                <label for="jd-input">Job Description (paste text or upload file)</label>
+                <div class="file-upload-area">
+                    <textarea id="jd-input" placeholder="Paste the job description here..." rows="4"></textarea>
+                    <div class="file-upload-row">
+                        <input type="file" id="jd-file" accept=".txt,.pdf,.doc,.docx" onchange="handleFileUpload('jd')">
+                        <span id="jd-status" class="upload-status"></span>
+                    </div>
+                </div>
             </div>
 
             <button class="btn btn-primary" onclick="startSession()">Start Coaching Session</button>
@@ -433,8 +541,85 @@
     <script>
         let sessionId = null;
         let currentStep = 'identify_principle';
+        let hasResume = false;
+        let hasJobDescription = false;
+        let currentInterviewerType = 'hiring_manager';
 
         const API_BASE = '/api';
+
+        function handleFileUpload(type) {
+            const fileInput = document.getElementById(type === 'resume' ? 'resume-file' : 'jd-file');
+            const textArea = document.getElementById(type === 'resume' ? 'resume-input' : 'jd-input');
+            const statusEl = document.getElementById(type === 'resume' ? 'resume-status' : 'jd-status');
+
+            const file = fileInput.files[0];
+            if (!file) return;
+
+            statusEl.textContent = 'Reading file...';
+            statusEl.className = 'upload-status';
+
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                textArea.value = e.target.result;
+                statusEl.textContent = 'File loaded: ' + file.name;
+            };
+            reader.onerror = function() {
+                statusEl.textContent = 'Error reading file';
+                statusEl.className = 'upload-status error';
+            };
+            reader.readAsText(file);
+        }
+
+        async function uploadResume() {
+            const resumeText = document.getElementById('resume-input').value.trim();
+            if (!resumeText || !sessionId) return false;
+
+            const result = await apiCall('/resume', {
+                session_id: sessionId,
+                resume_text: resumeText
+            });
+
+            if (result.error) {
+                console.error('Resume upload failed:', result.error);
+                return false;
+            }
+
+            hasResume = true;
+            addMessage('coach', '📄 Resume uploaded! Found ' + result.skills_found + ' skills and ' + result.experience_items + ' experience items.');
+            return true;
+        }
+
+        async function uploadJobDescription() {
+            const jdText = document.getElementById('jd-input').value.trim();
+            if (!jdText || !sessionId) return false;
+
+            const result = await apiCall('/job-description', {
+                session_id: sessionId,
+                job_description: jdText
+            });
+
+            if (result.error) {
+                console.error('Job description upload failed:', result.error);
+                return false;
+            }
+
+            hasJobDescription = true;
+            addMessage('coach', '📋 Job description uploaded! Found ' + result.requirements_found + ' requirements and ' + result.responsibilities_found + ' responsibilities.');
+            return true;
+        }
+
+        async function getPersonalizedQuestion() {
+            const result = await apiCall('/personalized-question', {
+                session_id: sessionId
+            });
+
+            if (result.error) {
+                addMessage('coach', '⚠️ ' + result.error);
+                return null;
+            }
+
+            return result;
+        }
 
         async function apiCall(endpoint, data = {}) {
             const response = await fetch(API_BASE + endpoint, {
@@ -448,22 +633,57 @@
         async function startSession() {
             const role = document.getElementById('role').value || 'Senior Study Manager';
             const company = document.getElementById('company').value || 'Taiho Oncology';
+            const interviewerType = document.getElementById('interviewer-type').value;
             const questionType = document.getElementById('question-type').value;
+            const resumeText = document.getElementById('resume-input').value.trim();
+            const jdText = document.getElementById('jd-input').value.trim();
 
             // Create session
-            const sessionResult = await apiCall('/sessions', { role, company });
+            const sessionResult = await apiCall('/sessions', { role, company, interviewer_type: interviewerType });
             sessionId = sessionResult.session_id;
-
-            // Get first question
-            const questionResult = await apiCall('/question', {
-                session_id: sessionId,
-                question_type: questionType
-            });
+            currentInterviewerType = interviewerType;
 
             // Update UI
             document.getElementById('setup-panel').classList.add('hidden');
             document.getElementById('chat-container').classList.add('active');
-            document.getElementById('current-type').textContent = questionType.replace('_', ' ');
+
+            // Show interviewer tips if available
+            if (sessionResult.interviewer_tips) {
+                addMessage('coach', '💡 Interviewer Tips: ' + sessionResult.interviewer_tips);
+            }
+
+            // Upload resume if provided
+            if (resumeText) {
+                await uploadResume();
+            }
+
+            // Upload job description if provided
+            if (jdText) {
+                await uploadJobDescription();
+            }
+
+            // Get first question
+            let questionResult;
+            if (questionType === 'personalized' && (resumeText || jdText)) {
+                questionResult = await getPersonalizedQuestion();
+                if (!questionResult || questionResult.error) {
+                    // Fall back to curveball if personalized fails
+                    questionResult = await apiCall('/question', {
+                        session_id: sessionId,
+                        question_type: 'curveball'
+                    });
+                }
+            } else {
+                questionResult = await apiCall('/question', {
+                    session_id: sessionId,
+                    question_type: questionType === 'personalized' ? 'curveball' : questionType
+                });
+            }
+
+            document.getElementById('current-type').textContent = (questionResult.question_type || questionType).replace('_', ' ');
+
+            // Show context badges if resume/jd uploaded
+            updateContextBadges();
 
             // Add question to chat
             addMessage('coach', questionResult.question);
@@ -472,6 +692,35 @@
             }
 
             updateStepIndicator(questionResult.current_step);
+        }
+
+        function updateContextBadges() {
+            const statusBar = document.querySelector('.status-bar > div');
+            let badgesHtml = '';
+
+            // Show interviewer type
+            const interviewerLabels = {
+                'hiring_manager': '👔 Hiring Manager',
+                'recruiter': '📞 Recruiter',
+                'skip_level': '⬆️ Skip-Level',
+                'peer': '🤝 Peer',
+                'hr': '📋 HR',
+                'panel': '👥 Panel'
+            };
+            badgesHtml += '<span class="context-badge interviewer">' + (interviewerLabels[currentInterviewerType] || '👔 Hiring Manager') + '</span>';
+
+            if (hasResume) {
+                badgesHtml += '<span class="context-badge">📄 Resume</span>';
+            }
+            if (hasJobDescription) {
+                badgesHtml += '<span class="context-badge">📋 JD</span>';
+            }
+            // Remove old badges
+            statusBar.querySelectorAll('.context-badge').forEach(el => el.remove());
+            // Add new badges
+            if (badgesHtml) {
+                statusBar.insertAdjacentHTML('beforeend', badgesHtml);
+            }
         }
 
         async function sendResponse() {
@@ -536,19 +785,33 @@
         }
 
         async function newQuestion() {
-            const questionType = prompt('Question type? (curveball, alignment, cro_management, behavioral, motivation)', 'curveball');
+            const options = 'curveball, alignment, cro_management, behavioral, motivation' +
+                          ((hasResume || hasJobDescription) ? ', personalized' : '');
+            const questionType = prompt('Question type? (' + options + ')', 'curveball');
             if (!questionType) return;
 
-            const result = await apiCall('/question', {
-                session_id: sessionId,
-                question_type: questionType
-            });
+            let result;
+            if (questionType === 'personalized') {
+                result = await getPersonalizedQuestion();
+                if (!result || result.error) {
+                    addMessage('coach', '⚠️ Could not generate personalized question. Trying standard question.');
+                    result = await apiCall('/question', {
+                        session_id: sessionId,
+                        question_type: 'curveball'
+                    });
+                }
+            } else {
+                result = await apiCall('/question', {
+                    session_id: sessionId,
+                    question_type: questionType
+                });
+            }
 
             // Clear messages
             document.getElementById('messages').innerHTML = '';
 
             // Update UI
-            document.getElementById('current-type').textContent = questionType.replace('_', ' ');
+            document.getElementById('current-type').textContent = (result.question_type || questionType).replace('_', ' ');
 
             addMessage('coach', result.question);
             if (result.instruction) {
