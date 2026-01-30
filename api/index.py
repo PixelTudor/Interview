@@ -567,7 +567,7 @@ def get_coaching_response(session: Dict, user_message: str) -> str:
     messages.append({"role": "user", "content": user_message})
 
     response = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-haiku-4-20250414",
         max_tokens=1024,
         system=system_prompt,
         messages=messages
